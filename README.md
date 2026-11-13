@@ -11,6 +11,14 @@ Requires: Windows 10/11, [VS 2022 Build Tools](https://visualstudio.microsoft.co
 py generate_test_pcap.py --seed 0 --output samples\test_dpi.pcap
 cmake -B build
 cmake --build build --config Release
+run.bat
+```
+
+`run.bat` double-clicks the demo: it finds the built `dpi_engine.exe` and runs the
+canonical capture (`--block-app YouTube --block-ip 192.168.1.50`).
+Or run it manually:
+
+```cmd
 .\build\Release\dpi_engine.exe samples\test_dpi.pcap out.pcap --block-app YouTube --block-ip 192.168.1.50
 ```
 
