@@ -2,7 +2,7 @@
 
 Offline PCAP inspector: parses Ethernet → IPv4 → TCP/UDP, classifies flows via TLS SNI / HTTP Host / DNS, tracks per-flow state, enforces IP / app / domain block rules, and writes a filtered PCAP plus a terminal report. Zero dependencies — standard C++17 only.
 
-![C++17](https://img.shields.io/badge/C%2B%2B-17-blue) ![Windows](https://img.shields.io/badge/Windows-VS2022%20%2B%20CMake-green) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue) ![Windows](https://img.shields.io/badge/Windows-VS2022%20%2B%20CMake-green)
 
 ## What it does
 
