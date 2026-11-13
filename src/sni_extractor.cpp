@@ -126,17 +126,6 @@ std::optional<std::string> SNIExtractor::extract(const uint8_t* payload, size_t 
     return std::nullopt;
 }
 
-std::vector<std::pair<uint16_t, std::string>> SNIExtractor::extractExtensions(
-    const uint8_t* payload, size_t length) {
-    
-    std::vector<std::pair<uint16_t, std::string>> extensions;
-    
-    // Similar parsing logic as extract(), but collect all extensions
-    // ... (abbreviated for brevity)
-    
-    return extensions;
-}
-
 // ============================================================================
 // HTTP Host Header Extractor Implementation
 // ============================================================================

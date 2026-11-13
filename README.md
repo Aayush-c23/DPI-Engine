@@ -63,8 +63,10 @@ run.bat                   double-click demo
 
 Details: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-## Ideas to extend
+## Design decisions
 
-- QUIC / HTTP3 Initial parsing (UDP 443, SNI inside CRYPTO frames)
-- Live capture backend (Npcap) alongside the offline reader
-- Bandwidth throttling instead of drop
+- **Offline PCAP, not live capture** — deterministic input makes blocking behavior testable and demoable without network access.
+- **Hash-pinned threading** — each five-tuple always lands on the same fast-path worker, so no cross-thread flow locking on the hot path.
+- **Portable byte order, no system headers** — `include/platform.h` does its own endian handling, which is why this builds unchanged on MSVC and MinGW.
+- **Label-boundary domain matching** — short domains (`x.com`, `t.co`) only match at DNS label boundaries; substring matching would misclassify `netflix.com` and `microsoft.com`.
+

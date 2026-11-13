@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate a test PCAP file with various protocols for DPI testing.
-Includes TLS Client Hello with SNI, HTTP, DNS, etc.
+Fixture generator for the DPI engine test capture.
+Builds a small PCAP with TLS Client Hello (SNI), HTTP, DNS, and blocked-IP
+traffic. Deterministic with --seed so results are reproducible.
 """
 
 import argparse

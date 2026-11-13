@@ -1,185 +1,92 @@
-# ARCHITECTURE � How the DPI Engine Works
+# Architecture — How the DPI Engine Works
 
-Deep dive for the curious. Start with [README.md](README.md) for the pitch, build, and results.
+Design notes for the curious. Start with [README.md](README.md) for the pitch, build, and results.
 
-## Table of Contents
+## Contents
 
-1. [What is DPI?](#1-what-is-dpi)
-2. [Networking Background](#2-networking-background)
-3. [Project Overview](#3-project-overview)
-4. [File Structure](#4-file-structure)
-5. [The Journey of a Packet (Simple Version)](#5-the-journey-of-a-packet-simple-version)
-6. [The Journey of a Packet (Multi-threaded Version)](#6-the-journey-of-a-packet-multi-threaded-version)
-7. [Deep Dive: Each Component](#7-deep-dive-each-component)
-8. [How SNI Extraction Works](#8-how-sni-extraction-works)
-9. [How Blocking Works](#9-how-blocking-works)
-10. [Building and Running](#10-building-and-running)
-11. [Understanding the Output](#11-understanding-the-output)
+1. [Background](#background)
+2. [Pipeline](#pipeline)
+3. [Packet walkthrough](#packet-walkthrough)
+4. [Components](#components)
+5. [SNI extraction](#sni-extraction)
+6. [Blocking](#blocking)
 
 ---
 
-## 1. What is DPI?
+## Background
 
-**Deep Packet Inspection (DPI)** is a technology used to examine the contents of network packets as they pass through a checkpoint. Unlike simple firewalls that only look at packet headers (source/destination IP), DPI looks *inside* the packet payload.
+**Deep Packet Inspection** examines packet payloads, not just headers. The key insight this
+engine relies on: the TLS ClientHello carries the destination domain in plaintext (SNI
+extension `0x0000`), so HTTPS traffic is classifiable from its first packet.
 
-### Real-World Uses:
-- **ISPs**: Throttle or block certain applications (e.g., BitTorrent)
-- **Enterprises**: Block social media on office networks
-- **Parental Controls**: Block inappropriate websites
-- **Security**: Detect malware or intrusion attempts
+Reference shapes:
 
-### What Our DPI Engine Does:
 ```
-User Traffic (PCAP) → [DPI Engine] → Filtered Traffic (PCAP)
-                           ↓
-                    - Identifies apps (YouTube, Facebook, etc.)
-                    - Blocks based on rules
-                    - Generates reports
+Layer 7:  HTTP, TLS, DNS
+Layer 4:  TCP (reliable), UDP (fast)
+Layer 3:  IP addresses (routing)
+Layer 2:  MAC addresses (local network)
 ```
+
+A flow is identified by its **five-tuple** (src/dst IP, src/dst port, protocol). All
+packets sharing a five-tuple belong to one connection, so blocking is applied at flow
+level: once a flow classifies as blocked, every subsequent packet drops.
 
 ---
 
-## 2. Networking Background
-
-### The Network Stack (Layers)
-
-When you visit a website, data travels through multiple "layers":
+## Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Layer 7: Application    │ HTTP, TLS, DNS               │
-├─────────────────────────────────────────────────────────┤
-│ Layer 4: Transport      │ TCP (reliable), UDP (fast)   │
-├─────────────────────────────────────────────────────────┤
-│ Layer 3: Network        │ IP addresses (routing)       │
-├─────────────────────────────────────────────────────────┤
-│ Layer 2: Data Link      │ MAC addresses (local network)│
-└─────────────────────────────────────────────────────────┘
+                    ┌─────────────────┐
+                    │  Reader Thread  │
+                    │  (reads PCAP)   │
+                    └────────┬────────┘
+                             │ hash(5-tuple) % LBs
+              ┌──────────────┴──────────────┐
+              ▼                             ▼
+    ┌─────────────────┐           ┌─────────────────┐
+    │  LB Thread      │           │  LB Thread      │
+    └────────┬────────┘           └────────┬────────┘
+             │ hash % FPs                   │ hash % FPs
+      ┌──────┴──────┐               ┌──────┴──────┐
+      ▼             ▼               ▼             ▼
+┌──────────┐ ┌──────────┐   ┌──────────┐ ┌──────────┐
+│ FP Thread│ │ FP Thread│   │ FP Thread│ │ FP Thread│
+└─────┬────┘ └─────┬────┘   └─────┬────┘ └─────┬────┘
+      └────────────┴──────────────┴────────────┘
+                          │ forward/drop
+                          ▼
+              ┌───────────────────────┐
+              │  Output Writer Thread │
+              └───────────────────────┘
 ```
 
-### A Packet's Structure
+Hash-pinning keeps every packet of a flow on the same fast-path worker, so per-flow
+state needs no cross-thread locking. Queues between stages are bounded
+(`max_size 10000`) blocking MPMC queues (`mutex` + `condition_variable`).
 
-Every network packet is like a **Russian nesting doll** - headers wrapped inside headers:
+### Two entry points
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ Ethernet Header (14 bytes)                                       │
-│ ┌──────────────────────────────────────────────────────────────┐ │
-│ │ IP Header (20 bytes)                                         │ │
-│ │ ┌──────────────────────────────────────────────────────────┐ │ │
-│ │ │ TCP Header (20 bytes)                                    │ │ │
-│ │ │ ┌──────────────────────────────────────────────────────┐ │ │ │
-│ │ │ │ Payload (Application Data)                           │ │ │ │
-│ │ │ │ e.g., TLS Client Hello with SNI                      │ │ │ │
-│ │ │ └──────────────────────────────────────────────────────┘ │ │ │
-│ │ └──────────────────────────────────────────────────────────┘ │ │
-│ └──────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### The Five-Tuple
-
-A **connection** (or "flow") is uniquely identified by 5 values:
-
-| Field | Example | Purpose |
-|-------|---------|---------|
-| Source IP | 192.168.1.100 | Who is sending |
-| Destination IP | 172.217.14.206 | Where it's going |
-| Source Port | 54321 | Sender's application identifier |
-| Destination Port | 443 | Service being accessed (443 = HTTPS) |
-| Protocol | TCP (6) | TCP or UDP |
-
-**Why is this important?** 
-- All packets with the same 5-tuple belong to the same connection
-- If we block one packet of a connection, we should block all of them
-- This is how we "track" conversations between computers
-
-### What is SNI?
-
-**Server Name Indication (SNI)** is part of the TLS/HTTPS handshake. When you visit `https://www.youtube.com`:
-
-1. Your browser sends a "Client Hello" message
-2. This message includes the domain name in **plaintext** (not encrypted yet!)
-3. The server uses this to know which certificate to send
-
-```
-TLS Client Hello:
-├── Version: TLS 1.2
-├── Random: [32 bytes]
-├── Cipher Suites: [list]
-└── Extensions:
-    └── SNI Extension:
-        └── Server Name: "www.youtube.com"  ← We extract THIS!
-```
-
-**This is the key to DPI**: Even though HTTPS is encrypted, the domain name is visible in the first packet!
+| File | Role |
+|------|------|
+| `src/dpi_mt.cpp` | Threaded engine (Reader → LB → FP → writer) |
+| `src/main_working.cpp` | Single-threaded reference (same classify + enforce logic, no threads) |
 
 ---
 
-## 3. Project Overview
+## Packet walkthrough
 
-### What This Project Does
+Reference: `src/main_working.cpp`. Same classify + enforce logic as the threaded
+engine, minus the queues.
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Wireshark   │     │ DPI Engine  │     │ Output      │
-│ Capture     │ ──► │             │ ──► │ PCAP        │
-│ (input.pcap)│     │ - Parse     │     │ (filtered)  │
-└─────────────┘     │ - Classify  │     └─────────────┘
-                    │ - Block     │
-                    │ - Report    │
-                    └─────────────┘
-```
-
-### Two Versions
-
-| Version | File | Use Case |
-|---------|------|----------|
-| Simple (Single-threaded) | `src/main_working.cpp` | Learning, small captures |
-| Multi-threaded | `src/dpi_mt.cpp` | Production, large captures |
-
----
-
-## 4. File Structure
-
-```
-dpi-engine/
-├── CMakeLists.txt               # Builds dpi_engine + dpi_simple (VS2022 / CMake)
-├── include/
-│   ├── pcap_reader.h           # PCAP file reading
-│   ├── packet_parser.h         # Network protocol parsing
-│   ├── sni_extractor.h         # TLS/HTTP inspection
-│   ├── types.h                 # Data structures (FiveTuple, AppType, etc.)
-│   └── platform.h              # Portable byte-order helpers (no system headers)
-│
-├── src/
-│   ├── pcap_reader.cpp         # PCAP file handling
-│   ├── packet_parser.cpp       # Protocol parsing
-│   ├── sni_extractor.cpp       # SNI/Host extraction
-│   ├── types.cpp               # App mapping (domainMatch guards short domains)
-│   ├── dpi_mt.cpp              # ★ MULTI-THREADED VERSION ★ (Reader -> LB -> FP -> writer)
-│   └── main_working.cpp        # ★ SIMPLE VERSION ★ (single-threaded reference)
-│
-├── generate_test_pcap.py       # Creates test data (py script --seed 0 --output samples\test_dpi.pcap)
-├── samples/test_dpi.pcap       # Sample capture with various traffic
-├── WINDOWS_SETUP.md            # Detailed Windows build walkthrough
-└── README.md                   # This file!
-```
-
----
-
-## 5. The Journey of a Packet (Simple Version)
-
-Let's trace a single packet through `main_working.cpp`:
-
-### Step 1: Read PCAP File
+### 1. Open
 
 ```cpp
 PcapReader reader;
 reader.open("capture.pcap");
 ```
 
-**What happens:**
+Behavior:
 1. Open the file in binary mode
 2. Read the 24-byte global header (magic number, version, etc.)
 3. Verify it's a valid PCAP file
@@ -199,7 +106,7 @@ reader.open("capture.pcap");
 └────────────────────────────┘
 ```
 
-### Step 2: Read Each Packet
+### 2. Iterate packets
 
 ```cpp
 while (reader.readNextPacket(raw)) {
@@ -208,18 +115,18 @@ while (reader.readNextPacket(raw)) {
 }
 ```
 
-**What happens:**
+Behavior:
 1. Read 16-byte packet header
 2. Read N bytes of packet data (N = header.incl_len)
 3. Return false when no more packets
 
-### Step 3: Parse Protocol Headers
+### 3. Parse headers
 
 ```cpp
 PacketParser::parse(raw, parsed);
 ```
 
-**What happens (in packet_parser.cpp):**
+In `packet_parser.cpp`:
 
 ```
 raw.data bytes:
@@ -265,7 +172,7 @@ Byte 12:     Data Offset (header length)
 Byte 13:     Flags (SYN, ACK, FIN, etc.)
 ```
 
-### Step 4: Create Five-Tuple and Look Up Flow
+### 4. Flow lookup
 
 ```cpp
 FiveTuple tuple;
@@ -278,13 +185,13 @@ tuple.protocol = parsed.protocol;
 Flow& flow = flows[tuple];  // Get or create
 ```
 
-**What happens:**
+Behavior:
 - The flow table is a hash map: `FiveTuple → Flow`
 - If this 5-tuple exists, we get the existing flow
 - If not, a new flow is created
 - All packets with the same 5-tuple share the same flow
 
-### Step 5: Extract SNI (Deep Packet Inspection)
+### 5. Classify payload
 
 ```cpp
 // For HTTPS traffic (port 443)
@@ -297,7 +204,7 @@ if (pkt.tuple.dst_port == 443 && pkt.payload_length > 5) {
 }
 ```
 
-**What happens (in sni_extractor.cpp):**
+In `sni_extractor.cpp`:
 
 1. **Check if it's a TLS Client Hello:**
    ```
@@ -328,7 +235,7 @@ if (pkt.tuple.dst_port == 443 && pkt.payload_length > 5) {
    }
    ```
 
-### Step 6: Check Blocking Rules
+### 6. Enforce rules
 
 ```cpp
 if (rules.isBlocked(tuple.src_ip, flow.app_type, flow.sni)) {
@@ -336,7 +243,7 @@ if (rules.isBlocked(tuple.src_ip, flow.app_type, flow.sni)) {
 }
 ```
 
-**What happens:**
+Behavior:
 ```cpp
 // Check IP blacklist
 if (blocked_ips.count(src_ip)) return true;
@@ -352,7 +259,7 @@ for (const auto& dom : blocked_domains) {
 return false;
 ```
 
-### Step 7: Forward or Drop
+### 7. Forward or drop
 
 ```cpp
 if (flow.blocked) {
@@ -366,9 +273,9 @@ if (flow.blocked) {
 }
 ```
 
-### Step 8: Generate Report
+### 8. Report
 
-After processing all packets:
+Report pass:
 ```cpp
 // Count apps
 for (const auto& [tuple, flow] : flows) {
@@ -383,181 +290,33 @@ for (const auto& [tuple, flow] : flows) {
 
 ---
 
-## 6. The Journey of a Packet (Multi-threaded Version)
+## Threaded engine (`src/dpi_mt.cpp`)
 
-The multi-threaded version (`dpi_mt.cpp`) adds **parallelism** for high performance:
+Same classify + enforce logic, parallelized. The Pipeline diagram above is the
+full picture; stage responsibilities:
 
-### Architecture Overview
+- **Reader** — `readNextPacket` → build `Packet` (copies bytes, computes payload
+  offset) → `hash(tuple) % LBs`. Skips non-IP and non-TCP/UDP.
+- **Load balancer** — pops from its input queue, `hash(tuple) % FPs`, pushes on.
+  Each LB owns a disjoint FP subset.
+- **Fast path** — per-FP flow table (`unordered_map<FiveTuple, FlowEntry>`):
+  get-or-create → classify if unknown → sticky block check → forward to the
+  output queue or drop. Per-app stats recorded under a mutex.
+- **Output writer** — single thread serializes `PcapPacketHeader` + bytes so the
+  output file can't interleave. After the reader drains, a short quiesce delay
+  lets queues empty before threads stop.
 
-```
-                    ┌─────────────────┐
-                    │  Reader Thread  │
-                    │  (reads PCAP)   │
-                    └────────┬────────┘
-                             │
-              ┌──────────────┴──────────────┐
-              │      hash(5-tuple) % 2      │
-              ▼                             ▼
-    ┌─────────────────┐           ┌─────────────────┐
-    │  LB0 Thread     │           │  LB1 Thread     │
-    │  (Load Balancer)│           │  (Load Balancer)│
-    └────────┬────────┘           └────────┬────────┘
-             │                             │
-      ┌──────┴──────┐               ┌──────┴──────┐
-      │hash % 2     │               │hash % 2     │
-      ▼             ▼               ▼             ▼
-┌──────────┐ ┌──────────┐   ┌──────────┐ ┌──────────┐
-│FP0 Thread│ │FP1 Thread│   │FP2 Thread│ │FP3 Thread│
-│(Fast Path)│ │(Fast Path)│   │(Fast Path)│ │(Fast Path)│
-└─────┬────┘ └─────┬────┘   └─────┬────┘ └─────┬────┘
-      │            │              │            │
-      └────────────┴──────────────┴────────────┘
-                          │
-                          ▼
-              ┌───────────────────────┐
-              │   Output Queue        │
-              └───────────┬───────────┘
-                          │
-                          ▼
-              ┌───────────────────────┐
-              │  Output Writer Thread │
-              │  (writes to PCAP)     │
-              └───────────────────────┘
-```
-
-### Why This Design?
-
-1. **Load Balancers (LBs):** Distribute work across FPs
-2. **Fast Paths (FPs):** Do the actual DPI processing
-3. **Consistent Hashing:** Same 5-tuple always goes to same FP
-
-**Why consistent hashing matters:**
-```
-Connection: 192.168.1.100:54321 → 142.250.185.206:443
-
-Packet 1 (SYN):         hash → FP2
-Packet 2 (SYN-ACK):     hash → FP2  (same FP!)
-Packet 3 (Client Hello): hash → FP2  (same FP!)
-Packet 4 (Data):        hash → FP2  (same FP!)
-
-All packets of this connection go to FP2.
-FP2 can track the flow state correctly.
-```
-
-### Detailed Flow
-
-#### Step 1: Reader Thread
-
-```cpp
-// Main thread reads PCAP
-while (reader.readNextPacket(raw)) {
-    Packet pkt = createPacket(raw);
-    
-    // Hash to select Load Balancer
-    size_t lb_idx = hash(pkt.tuple) % num_lbs;
-    
-    // Push to LB's queue
-    lbs_[lb_idx]->queue().push(pkt);
-}
-```
-
-#### Step 2: Load Balancer Thread
-
-```cpp
-void LoadBalancer::run() {
-    while (running_) {
-        // Pop from my input queue
-        auto pkt = input_queue_.pop();
-        
-        // Hash to select Fast Path
-        size_t fp_idx = hash(pkt.tuple) % num_fps_;
-        
-        // Push to FP's queue
-        fps_[fp_idx]->queue().push(pkt);
-    }
-}
-```
-
-#### Step 3: Fast Path Thread
-
-```cpp
-void FastPath::run() {
-    while (running_) {
-        // Pop from my input queue
-        auto pkt = input_queue_.pop();
-        
-        // Look up flow (each FP has its own flow table)
-        Flow& flow = flows_[pkt.tuple];
-        
-        // Classify (SNI extraction)
-        classifyFlow(pkt, flow);
-        
-        // Check rules
-        if (rules_->isBlocked(pkt.tuple.src_ip, flow.app_type, flow.sni)) {
-            stats_->dropped++;
-        } else {
-            // Forward: push to output queue
-            output_queue_->push(pkt);
-        }
-    }
-}
-```
-
-#### Step 4: Output Writer Thread
-
-```cpp
-void outputThread() {
-    while (running_ || output_queue_.size() > 0) {
-        auto pkt = output_queue_.pop();
-        
-        // Write to output file
-        output_file.write(packet_header);
-        output_file.write(pkt.data);
-    }
-}
-```
-
-### Thread-Safe Queue
-
-The magic that makes multi-threading work:
-
-```cpp
-template<typename T>
-class TSQueue {
-    std::queue<T> queue_;
-    std::mutex mutex_;
-    std::condition_variable not_empty_;
-    std::condition_variable not_full_;
-    
-    void push(T item) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push(item);
-        not_empty_.notify_one();  // Wake up waiting consumer
-    }
-    
-    T pop() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        not_empty_.wait(lock, [&]{ return !queue_.empty(); });
-        T item = queue_.front();
-        queue_.pop();
-        return item;
-    }
-};
-```
-
-**How it works:**
-- `push()`: Producer adds item, signals waiting consumers
-- `pop()`: Consumer waits until item available, then takes it
-- `mutex`: Only one thread can access at a time
-- `condition_variable`: Efficient waiting (no busy-loop)
+Inter-stage queues are bounded (`10000`) blocking MPMC queues over
+`mutex` + `condition_variable`: `push` blocks when full, `pop` waits with a
+timeout so shutdown stays responsive.
 
 ---
 
-## 7. Deep Dive: Each Component
+## Components
 
 ### pcap_reader.h / pcap_reader.cpp
 
-**Purpose:** Read network captures saved by Wireshark
+**Role:** offline PCAP source
 
 **Key structures:**
 ```cpp
@@ -682,7 +441,7 @@ AppType sniToAppType(const std::string& sni) {
 
 ---
 
-## 8. How SNI Extraction Works
+## SNI extraction
 
 ### The TLS Handshake
 
@@ -743,7 +502,7 @@ Extension Length: L
   SNI Value: "www.youtube.com" ← THE GOAL!
 ```
 
-### Our Extraction Code (Simplified)
+### Extraction walkthrough
 
 ```cpp
 std::optional<std::string> SNIExtractor::extract(
@@ -796,7 +555,7 @@ std::optional<std::string> SNIExtractor::extract(
 
 ---
 
-## 9. How Blocking Works
+## Blocking
 
 ### Rule Types
 
@@ -830,9 +589,11 @@ Packet arrives
             FORWARD
 ```
 
-### Flow-Based Blocking
+### Sticky flow blocking
 
-**Important:** We block at the *flow* level, not packet level.
+Blocking applies at *flow* level: early packets forward until the ClientHello
+reveals the SNI, then the flow pins to blocked and every subsequent packet drops.
+The client connection stalls on timeout — no RST injection needed.
 
 ```
 Connection to YouTube:
@@ -848,182 +609,10 @@ Connection to YouTube:
   ...all subsequent packets → DROP
 ```
 
-**Why this approach?**
-- We can't identify the app until we see the Client Hello
-- Once identified, we block all future packets of that flow
-- The connection will fail/timeout on the client
+**Rationale:** classification is only possible once the ClientHello arrives, so
+pre-SNI packets necessarily forward; pinning the verdict to the flow keeps later
+packets consistent without re-inspection.
 
 ---
 
-## 10. Building and Running
-
-### Prerequisites
-
-- Windows 10/11, VS 2022 Build Tools with "Desktop development with C++"
-- CMake 3.16+, Python 3.x
-- No external C++ libraries - standard C++17 only. See `WINDOWS_SETUP.md` for the full walkthrough.
-
-### Build Commands
-
-```cmd
-cmake -B build
-cmake --build build --config Release
-```
-
-This produces `build\Release\dpi_engine.exe` (multi-threaded) and `build\Release\dpi_simple.exe` (single-threaded reference).
-
-### Running
-
-**Basic usage:**
-```cmd
-.\build\Release\dpi_engine.exe samples\test_dpi.pcap out.pcap
-```
-
-**With blocking:**
-```cmd
-.\build\Release\dpi_engine.exe samples\test_dpi.pcap out.pcap --block-app YouTube --block-app TikTok --block-ip 192.168.1.50 --block-domain facebook
-```
-
-**Configure threads (multi-threaded only):**
-```cmd
-.\build\Release\dpi_engine.exe input.pcap output.pcap --lbs 4 --fps 4
-:: Creates 4 LB threads x 4 FP threads = 16 processing threads
-```
-
-### Creating Test Data
-
-```cmd
-py generate_test_pcap.py --seed 0 --output samples\test_dpi.pcap
-:: Creates samples\test_dpi.pcap with sample traffic
-```
-
----
-
-## 11. Understanding the Output
-
-### Sample Output
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║              DPI ENGINE v2.0 (Multi-threaded)                 ║
-╠══════════════════════════════════════════════════════════════╣
-║ Load Balancers:  2    FPs per LB:  2    Total FPs:  4        ║
-╚══════════════════════════════════════════════════════════════╝
-
-[Rules] Blocked app: YouTube
-[Rules] Blocked IP: 192.168.1.50
-
-[Reader] Processing packets...
-[Reader] Done reading 77 packets
-
-╔══════════════════════════════════════════════════════════════╗
-║                      PROCESSING REPORT                        ║
-╠══════════════════════════════════════════════════════════════╣
-║ Total Packets:                77                              ║
-║ Total Bytes:                5738                              ║
-║ TCP Packets:                  73                              ║
-║ UDP Packets:                   4                              ║
-╠══════════════════════════════════════════════════════════════╣
-║ Forwarded:                    69                              ║
-║ Dropped:                       8                              ║
-╠══════════════════════════════════════════════════════════════╣
-║ THREAD STATISTICS                                             ║
-║   LB0 dispatched:             53                              ║
-║   LB1 dispatched:             24                              ║
-║   FP0 processed:              53                              ║
-║   FP1 processed:               0                              ║
-║   FP2 processed:               0                              ║
-║   FP3 processed:              24                              ║
-╠══════════════════════════════════════════════════════════════╣
-║                   APPLICATION BREAKDOWN                       ║
-╠══════════════════════════════════════════════════════════════╣
-║ HTTPS                39  50.6% ##########                     ║
-║ Unknown              16  20.8% ####                           ║
-║ YouTube               4   5.2% # (BLOCKED)                    ║
-║ DNS                   4   5.2% #                              ║
-║ Facebook              3   3.9%                                ║
-║ ...                                                           ║
-╚══════════════════════════════════════════════════════════════╝
-
-[Detected Domains/SNIs]
-  - www.youtube.com -> YouTube
-  - www.facebook.com -> Facebook
-  - www.google.com -> Google
-  - github.com -> GitHub
-  ...
-```
-
-### What Each Section Means
-
-| Section | Meaning |
-|---------|---------|
-| Configuration | Number of threads created |
-| Rules | Which blocking rules are active |
-| Total Packets | Packets read from input file |
-| Forwarded | Packets written to output file |
-| Dropped | Packets blocked (not written) |
-| Thread Statistics | Work distribution across threads |
-| Application Breakdown | Traffic classification results |
-| Detected SNIs | Actual domain names found |
-
----
-
-## 12. Extending the Project
-
-### Ideas for Improvement
-
-1. **Add More App Signatures**
-   ```cpp
-   // In types.cpp
-   if (sni.find("twitch") != std::string::npos)
-       return AppType::TWITCH;
-   ```
-
-2. **Add Bandwidth Throttling**
-   ```cpp
-   // Instead of DROP, delay packets
-   if (shouldThrottle(flow)) {
-       std::this_thread::sleep_for(10ms);
-   }
-   ```
-
-3. **Add Live Statistics Dashboard**
-   ```cpp
-   // Separate thread printing stats every second
-   void statsThread() {
-       while (running) {
-           printStats();
-           std::this_thread::sleep_for(std::chrono::seconds(1));
-       }
-   }
-   ```
-
-4. **Add QUIC/HTTP3 Support**
-   - QUIC uses UDP on port 443
-   - SNI is in the Initial packet (encrypted differently)
-
-5. **Add Persistent Rules**
-   - Save rules to file
-   - Load on startup
-
----
-
-## Summary
-
-This DPI engine demonstrates:
-
-1. **Network Protocol Parsing** - Understanding packet structure
-2. **Deep Packet Inspection** - Looking inside encrypted connections
-3. **Flow Tracking** - Managing stateful connections
-4. **Multi-threaded Architecture** - Scaling with thread pools
-5. **Producer-Consumer Pattern** - Thread-safe queues
-
-The key insight is that even HTTPS traffic leaks the destination domain in the TLS handshake, allowing network operators to identify and control application usage.
-
----
-
-## Questions?
-
-If you have questions about any part of this project, the code is well-commented and follows the same flow described in this document. Start with the simple version (`main_working.cpp`) to understand the concepts, then move to the multi-threaded version (`dpi_mt.cpp`) to see how parallelism is added.
-
-Happy learning! 🚀
+*Build, run, and sample output: [README.md](README.md). Setup help: [WINDOWS_SETUP.md](WINDOWS_SETUP.md).*

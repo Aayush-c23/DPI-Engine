@@ -1,5 +1,6 @@
-// Multi-threaded DPI Engine - Fixed Version
-// Architecture: Reader -> LB threads -> FP threads -> Output
+// Multi-threaded DPI engine.
+// Pipeline: reader -> load balancers -> fast paths -> output writer.
+// Hash of the five-tuple pins each flow to one fast-path worker.
 
 #include <iostream>
 #include <fstream>

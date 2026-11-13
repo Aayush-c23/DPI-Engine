@@ -1,6 +1,6 @@
-# Windows Setup Guide
+# Windows Setup
 
-Canonical path: **Visual Studio 2022 + CMake**. Alternatives (MinGW, WSL) are footnotes at the bottom.
+Canonical: **Visual Studio 2022 + CMake**. MinGW and WSL notes at the bottom.
 
 ## 1. Install prerequisites
 
@@ -11,7 +11,7 @@ Canonical path: **Visual Studio 2022 + CMake**. Alternatives (MinGW, WSL) are fo
 
 ## 2. Get the code and build
 
-Open a fresh terminal (new terminal picks up PATH changes; no restart needed):
+Open a fresh terminal (picks up PATH changes):
 
 ```cmd
 cd /d "C:\path\to\dpi-engine"

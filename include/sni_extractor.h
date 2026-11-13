@@ -4,7 +4,6 @@
 #include <string>
 #include <cstdint>
 #include <optional>
-#include <vector>
 
 namespace DPI {
 
@@ -51,10 +50,6 @@ public:
     
     // Check if this looks like a TLS Client Hello
     static bool isTLSClientHello(const uint8_t* payload, size_t length);
-    
-    // Extract all extensions (for debugging/logging)
-    static std::vector<std::pair<uint16_t, std::string>> extractExtensions(
-        const uint8_t* payload, size_t length);
 
 private:
     // TLS Constants

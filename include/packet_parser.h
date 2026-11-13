@@ -9,7 +9,6 @@
 namespace PacketAnalyzer {
 
 // Ethernet Header (14 bytes)
-// This is the first layer - the "envelope" for the packet
 struct EthernetHeader {
     std::array<uint8_t, 6> dest_mac;    // Destination MAC address
     std::array<uint8_t, 6> src_mac;     // Source MAC address
@@ -52,7 +51,7 @@ struct UDPHeader {
     uint16_t checksum;         // Checksum
 };
 
-// Parsed packet information - human-readable format
+// Decoded packet fields
 struct ParsedPacket {
     // Timestamps
     uint32_t timestamp_sec;
@@ -93,7 +92,7 @@ public:
     // Parse a raw packet and fill in the ParsedPacket structure
     static bool parse(const RawPacket& raw, ParsedPacket& parsed);
     
-    // Helper functions to convert to human-readable strings
+    // Formatting helpers
     static std::string macToString(const uint8_t* mac);
     static std::string ipToString(uint32_t ip);
     static std::string protocolToString(uint8_t protocol);

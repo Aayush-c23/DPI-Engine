@@ -1,4 +1,4 @@
-// Working DPI Engine - Simplified but functional
+// Single-threaded DPI reference: read -> parse -> classify -> enforce -> report.
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
